@@ -1,0 +1,346 @@
+# Chasqui TunjoSoft — Orquestación de contenedores
+#
+# Levanta todo el sistema con:  docker compose up -d
+# Requiere un archivo .env en esta misma carpeta (copiar desde .env.example).
+#
+# NOTA sobre el orden de inicialización de la base de datos:
+#   La imagen oficial de Postgres ejecuta TODO lo que hay en
+#   /docker-entrypoint-initdb.d en orden alfabético, pero ignora los
+#   subdirectorios. Por eso ./db/migrations se monta como el contenido completo
+#   de esa ruta y ahí conviven los .sh y los .sql, ordenados por su prefijo:
+#     000_n8n_db.sh    → crea la base y el usuario propios de n8n
+#     010_ … 110_      → esquema, funciones, permisos y seeds
+#     900_superadmin.sh→ contraseñas de los roles de aplicación y superadmin
+#   Los prefijos son de TRES dígitos a propósito: con dos ("00_"), el guión bajo
+#   se ordena DESPUÉS de cualquier dígito y el script correría al final.
+#   Tampoco se monta ningún archivo suelto dentro de esta ruta: el directorio va
+#   montado :ro y Docker no puede crear un punto de montaje dentro de él.
+#   Todo esto solo corre la PRIMERA vez, cuando el volumen pgdata está vacío.
+
+name: chasqui_tunjosoft
+
+services:
+  # ---------------------------------------------------------------------------
+  # Base de datos — fuente única de verdad
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: chasqui-tunjosoft-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Variables que consumen los scripts de ./db/init
+      N8N_DB_NAME: ${N8N_DB_NAME}
+      N8N_DB_USER: ${N8N_DB_USER}
+      N8N_DB_PASSWORD: ${N8N_DB_PASSWORD}
+      # Disponibles para los seeds: el superadmin inicial se crea con estos datos
+      SUPERADMIN_TELEGRAM_USER_ID: ${SUPERADMIN_TELEGRAM_USER_ID}
+      SUPERADMIN_NOMBRE: ${SUPERADMIN_NOMBRE}
+      # Contraseñas de los roles de aplicación, que fija 900_superadmin.sh
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+      READONLY_DB_PASSWORD: ${READONLY_DB_PASSWORD}
+      TZ: ${TZ}
+      PGTZ: ${TZ}
+      # Locale e índices sensibles a acentos/ñ para las búsquedas del catálogo
+      LANG: es_CO.UTF-8
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      # Solo accesible desde la máquina anfitriona, nunca desde la LAN
+      # 5435 en el anfitrión: 5432 Chasqui (n8n), 5433 Chasqui Pet, 5434 Assistant.
+      # Los cuatro sistemas son independientes y conviven en la misma máquina.
+      - "127.0.0.1:${PUERTO_DB:-5435}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - chasqui_tunjosoft
+
+  # ---------------------------------------------------------------------------
+  # n8n — orquestación de webhooks y jobs
+  # ---------------------------------------------------------------------------
+  n8n:
+    # Versión fija, no "latest": esto puede volverse producción sin avisar y una
+    # actualización silenciosa de n8n no puede cambiar el comportamiento del bot.
+    # Para subir de versión: cambie el número aquí, levante, y vuelva a correr
+    # bash scripts/importar-n8n.sh.
+    image: n8nio/n8n:2.31.5
+    container_name: chasqui-tunjosoft-n8n
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      N8N_HOST: ${N8N_HOST}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      GENERIC_TIMEZONE: ${TZ}
+      TZ: ${TZ}
+      # Autenticación básica del panel de n8n
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      # Clave con la que n8n cifra las credenciales guardadas. Si cambia, se pierden.
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      # n8n guarda su propio estado en una base SEPARADA (n8n), con usuario propio,
+      # dentro del mismo servidor Postgres. Nunca en la base de negocio.
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: db
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${N8N_DB_NAME}
+      DB_POSTGRESDB_USER: ${N8N_DB_USER}
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD}
+      DB_POSTGRESDB_SCHEMA: public
+      # Ejecuta los nodos en un proceso aparte (recomendado desde n8n 1.x)
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      # Cadena de conexión a la base de negocio, para los nodos Postgres
+      DATABASE_URL: ${DATABASE_URL}
+      # El workflow del webhook arma la URL de la Bot API con $env.TELEGRAM_BOT_TOKEN,
+      # así el token no queda escrito dentro del JSON versionado del workflow.
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME}
+      # El workflow de WhatsApp arma la URL de la Graph API y compara el
+      # verify token con estas variables, por lo mismo: no quedan escritas
+      # dentro del JSON versionado.
+      WHATSAPP_TOKEN: ${WHATSAPP_TOKEN:-}
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+      WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:-}
+      WHATSAPP_API_VERSION: ${WHATSAPP_API_VERSION:-}
+      # Necesario para que las expresiones puedan leer $env (por defecto n8n lo bloquea).
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      # Los workflows guardan las ejecuciones exitosas (saveDataSuccessExecution:
+      # "all"). Sin poda crecerían sin límite: el webhook del bot se ejecuta una
+      # vez por cada toque de botón del personal.
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: 168      # horas = 7 días
+      EXECUTIONS_DATA_PRUNE_MAX_COUNT: 10000
+    volumes:
+      - n8ndata:/home/node/.n8n
+      # Workflows versionados en el repositorio, disponibles para importar:
+      #   docker compose exec n8n n8n import:workflow --separate --input=/workflows
+      - ./n8n/workflows:/workflows:ro
+    ports:
+      - "127.0.0.1:${PUERTO_N8N:-5681}:5678"   # 5681: 5678/5679/5680 tomados por Chasqui, Chasqui Pet y Assistant
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:5678/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - chasqui_tunjosoft
+
+  # ---------------------------------------------------------------------------
+  # Worker — cola de tareas asíncronas (tarea_async)
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    image: chasqui-tunjosoft/worker:latest
+    container_name: chasqui-tunjosoft-worker
+    # El worker debe reintentar siempre: si muere, la cola deja de drenarse.
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ}
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME}
+      # WhatsApp (Meta Cloud API). Vacías = el canal existe pero no envía, y
+      # lo dice en el resultado de la tarea en vez de fallar en silencio.
+      WHATSAPP_TOKEN: ${WHATSAPP_TOKEN:-}
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+      WHATSAPP_API_VERSION: ${WHATSAPP_API_VERSION:-}
+      SUPERADMIN_TELEGRAM_USER_ID: ${SUPERADMIN_TELEGRAM_USER_ID}
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL}
+      WORKER_INTERVALO_MS: ${WORKER_INTERVALO_MS}
+      WORKER_LOTE: ${WORKER_LOTE}
+      # «Habla con Chasqui» (§ 078_chasqui_ia.sql). El worker es el único
+      # contenedor que la necesita: n8n y la web nunca llaman al modelo.
+      # Sin ella el asistente avisa que no está configurado y el resto del
+      # bot sigue funcionando igual.
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      # Sólo se toca para apuntar a otro servidor compatible con la API de
+      # OpenAI. Vacío = api.deepseek.com.
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-}
+      # Cuánto espera al modelo antes de darse por vencido. El proveedor de
+      # turno manda: un catálogo compartido arranca en frío y tarda más que
+      # una API dedicada. Vacío = 90 s (el valor del código).
+      IA_TIMEOUT_MS: ${IA_TIMEOUT_MS:-}
+    networks:
+      - chasqui_tunjosoft
+
+  # ---------------------------------------------------------------------------
+  # Web — portal administrativo + pantalla pública de turnos
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    image: chasqui-tunjosoft/web:latest
+    container_name: chasqui-tunjosoft-web
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ}
+      NODE_ENV: production
+      HOSTNAME: "0.0.0.0"
+      PORT: 3000
+      DATABASE_URL: ${DATABASE_URL}
+      SESSION_SECRET: ${SESSION_SECRET}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME}
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL}
+      N8N_INTERNAL_URL: http://n8n:5678
+    ports:
+      # Expuesto a toda la LAN: la pantalla pública de turnos se ve desde el
+      # monitor de la sala de espera, que es otro equipo de la red.
+      - "0.0.0.0:${PUERTO_WEB:-3300}:3000"      # 3300: portal y simulador de chat del demo de TunjoSoft
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    networks:
+      - chasqui_tunjosoft
+
+  # ---------------------------------------------------------------------------
+  # Backup — pg_dump diario con retención de 14 días
+  # ---------------------------------------------------------------------------
+  backup:
+    image: postgres:16-alpine
+    container_name: chasqui-tunjosoft-backup
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ}
+      PGTZ: ${TZ}
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      BACKUP_DIR: /backups
+      BACKUP_RETENCION_DIAS: ${BACKUP_RETENCION_DIAS}
+      BACKUP_HORA: ${BACKUP_HORA}
+    entrypoint: ["/bin/sh", "/scripts/backup.sh"]
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./backups:/backups
+    networks:
+      - chasqui_tunjosoft
+
+  # ---------------------------------------------------------------------------
+  # Proxy — la única puerta que da a internet
+  #
+  # Un solo hostname público para las dos cosas que tienen que salir: el
+  # webhook de Telegram (a n8n) y el portal con la pantalla (a web). Que el
+  # enlace de ingreso del bot y el webhook compartan dominio no es estética:
+  # es lo que permite que el portal se abra desde afuera sin abrirle también
+  # el editor de n8n, que este proxy no enruta.
+  # ---------------------------------------------------------------------------
+  proxy:
+    image: caddy:2-alpine
+    container_name: chasqui-tunjosoft-proxy
+    restart: unless-stopped
+    depends_on:
+      - web
+      - n8n
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+    ports:
+      # Sólo local: hacia afuera se sale por el túnel, no por este puerto.
+      - "127.0.0.1:${PUERTO_PROXY:-8083}:80"
+    networks:
+      - chasqui_tunjosoft
+
+  # ---------------------------------------------------------------------------
+  # cloudflared — túnel HTTPS público
+  #
+  # Telegram sólo entrega webhooks a direcciones HTTPS, y una máquina de la
+  # clínica no tiene una. El túnel publica el PROXY, no n8n: así la misma
+  # dirección sirve el webhook y el portal, y el enlace de ingreso que manda
+  # el bot funciona desde cualquier parte, no sólo desde la red de la clínica.
+  # La base de datos no sale nunca.
+  #
+  # No arranca solo: vive en el perfil "local" porque en un despliegue con
+  # dominio propio sobra. Se levanta con
+  #     docker compose --profile local up -d
+  # Un túnel rápido de Cloudflare cambia de dirección en cada arranque; de eso
+  # se encarga el registrador, no una persona.
+  # ---------------------------------------------------------------------------
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: chasqui-tunjosoft-cloudflared
+    restart: unless-stopped
+    profiles: ["local"]
+    # --metrics expone /quicktunnel, que es de donde el registrador lee el
+    # hostname del momento. Sin eso habría que ir a leerlo del log a mano.
+    command: tunnel --no-autoupdate --metrics 0.0.0.0:2000 --url http://proxy:80
+    depends_on:
+      - proxy
+    networks:
+      - chasqui_tunjosoft
+
+  # ---------------------------------------------------------------------------
+  # Registrador — mantiene el webhook y el enlace del portal apuntando al túnel
+  # ---------------------------------------------------------------------------
+  registrador:
+    image: alpine:3.20
+    container_name: chasqui-tunjosoft-registrador
+    restart: unless-stopped
+    profiles: ["local"]
+    depends_on:
+      cloudflared:
+        condition: service_started
+      db:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_WEBHOOK_PATH: chasqui-tunjosoft-telegram
+      # Vacía = descubrir el túnel. Con dominio propio se fija y el
+      # registrador deja de adivinar.
+      WEBHOOK_URL: ${WEBHOOK_URL_FIJA:-}
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+    entrypoint: ["/bin/sh", "/scripts/registrar-publico.sh"]
+    volumes:
+      - ./scripts:/scripts:ro
+    networks:
+      - chasqui_tunjosoft
+
+volumes:
+  pgdata:
+    name: chasqui_tunjosoft_pgdata
+  n8ndata:
+    name: chasqui_tunjosoft_n8ndata
+  caddydata:
+    name: chasqui_tunjosoft_caddydata
+
+networks:
+  chasqui_tunjosoft:
+    name: chasqui_tunjosoft
+    driver: bridge

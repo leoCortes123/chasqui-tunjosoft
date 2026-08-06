@@ -1,0 +1,99 @@
+{
+  "id": "chasqui_tunjosoftMant",
+  "name": "Chasqui TunjoSoft — Mantenimiento diario",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 15 3 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-mantenimiento",
+      "name": "Cada día 3:15",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Purga lo que crece para siempre y no sirve pasadas unas semanas:\n-- updates de Telegram, conversaciones vencidas, challenges de ingreso y\n-- tareas ya completadas. NO toca la auditoría ni los mensajes:\n-- ésos no se purgan nunca, y ahí está su valor.\nSELECT mantenimiento_diario() AS resultado;",
+        "options": {}
+      },
+      "id": "sql-mantenimiento",
+      "name": "Purga diaria",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "chasqui-tunjosoft-postgres",
+          "name": "Chasqui TunjoSoft Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- A las 3 de la mañana no hay nadie usando el sistema: es el momento de\n-- que Postgres recalcule las estadísticas de las tablas que más se\n-- mueven. Sin esto, la búsqueda por nombre del pipeline se\n-- degrada según crece el histórico de interacciones.\nANALYZE mensaje, ia_mensaje, interaccion, reunion, evento_auditoria;\nSELECT 1 AS ok;",
+        "options": {}
+      },
+      "id": "sql-analyze",
+      "name": "Recalcular estadísticas",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "chasqui-tunjosoft-postgres",
+          "name": "Chasqui TunjoSoft Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Cada día 3:15": {
+      "main": [
+        [
+          {
+            "node": "Purga diaria",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Purga diaria": {
+      "main": [
+        [
+          {
+            "node": "Recalcular estadísticas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Bogota",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "active": true
+}
